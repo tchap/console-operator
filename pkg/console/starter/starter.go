@@ -42,6 +42,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
 	"github.com/openshift/console-operator/pkg/api"
+	consoleapiserver "github.com/openshift/console-operator/pkg/console/configobservation/apiserver"
 	"github.com/openshift/console-operator/pkg/console/configobservation/configobservercontroller"
 	"github.com/openshift/console-operator/pkg/console/controllers/clidownloads"
 	"github.com/openshift/console-operator/pkg/console/controllers/clioidcclientstatus"
@@ -91,6 +92,10 @@ const (
 	oauthClientResource    = "oauthclients"
 	consolePluginResource  = "consoleplugins"
 )
+
+// tlsGroupPreferencesFeatureGate gates observation of servingInfo.tlsGroups.
+// Defined locally until the openshift/api features package is vendored.
+const tlsGroupPreferencesFeatureGate configv1.FeatureGateName = "TLSGroupPreferences"
 
 func RunOperator(ctx context.Context, controllerContext *controllercmd.ControllerContext) error {
 
@@ -672,12 +677,16 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 	logLevelController := loglevel.NewClusterOperatorLoggingController(operatorClient, controllerContext.EventRecorder)
 	managementStateController := managementstatecontroller.NewOperatorManagementStateController(api.ClusterOperatorName, operatorClient, controllerContext.EventRecorder)
 
-	// Config observer watches APIServer and writes TLS config to Console CR's observedConfig
+	// Config observer watches APIServer and writes TLS config to Console CR's observedConfig.
+	// tlsGroups is gated on the TLSGroupPreferences feature gate; FIPS mode is resolved once
+	// here since it is an immutable property of the node's kernel.
 	configObserver := configobservercontroller.NewConfigObserver(
 		operatorClient,
 		configInformers,
 		resourceSyncer,
 		recorder,
+		featureGates.Enabled(tlsGroupPreferencesFeatureGate),
+		consoleapiserver.IsFIPSEnabled(),
 	)
 
 	for _, informer := range []interface {
