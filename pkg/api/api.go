@@ -1,6 +1,8 @@
 package api
 
 const (
+	// AuthProxyStagingConfigMapName holds configuration for Pods acquiring the proxy CA mount.
+	AuthProxyStagingConfigMapName = "console-config-auth-proxy"
 	// AuthProxyCAConfigMapName is the destination name used for the auth proxy trustedCA ConfigMap
 	// when copying it into local namespaces.
 	AuthProxyCAConfigMapName = "v4-0-config-system-auth-proxy-ca"

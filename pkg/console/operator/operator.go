@@ -410,6 +410,7 @@ func (c *consoleOperator) removeConsole(ctx context.Context, operatorConfig *ope
 	// configmaps
 	errs = append(errs, c.configMapClient.ConfigMaps(api.TargetNamespace).Delete(ctx, api.AuthProxyCAConfigMapName, metav1.DeleteOptions{}))
 	errs = append(errs, c.configMapClient.ConfigMaps(api.TargetNamespace).Delete(ctx, configmap.Stub().Name, metav1.DeleteOptions{}))
+	errs = append(errs, c.configMapClient.ConfigMaps(api.TargetNamespace).Delete(ctx, api.AuthProxyStagingConfigMapName, metav1.DeleteOptions{}))
 	errs = append(errs, c.configMapClient.ConfigMaps(api.TargetNamespace).Delete(ctx, configmap.ServiceCAStub().Name, metav1.DeleteOptions{}))
 	// secret
 	errs = append(errs, c.secretsClient.Secrets(api.TargetNamespace).Delete(ctx, secret.Stub().Name, metav1.DeleteOptions{}))

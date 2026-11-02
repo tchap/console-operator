@@ -194,15 +194,9 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
 		return statusHandler.FlushAndReturn(ctx, authProxyTrustedCAErr)
 	}
 
-	authProxyMountReason, authProxyMountErr := co.syncAuthProxyCAMount(ctx, authProxy)
-	statusHandler.AddConditions(status.HandleProgressingOrDegraded("AuthProxyCAMountSync", authProxyMountReason, authProxyMountErr))
-	if authProxyMountErr != nil {
-		return statusHandler.FlushAndReturn(ctx, authProxyMountErr)
-	}
-
 	additionalHosts := routesub.GetAdditionalRouteHostnames(set.Ingress)
 
-	cm, cmErrReason, cmErr := co.SyncConfigMap(
+	cm, cmErrReason, cmErr := co.BuildConfigMap(
 		ctx,
 		set.Operator,
 		set.Console,
@@ -260,6 +254,23 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
 		return statusHandler.FlushAndReturn(ctx, servingCertErr)
 	}
 
+	// Build the complete desired template so staging includes every referenced
+	// file, including an issuer CA introduced together with the proxy CA.
+	desiredDeployment := deploymentsub.DefaultDeployment(set.Operator, cm, serviceCAConfigMap,
+		oauthServingCertConfigMap, targetNamespaceAuthServerCA, trustedCAConfigMap,
+		clientSecret, sessionSecret, consoleServingCertSecret, set.Proxy, set.Infrastructure, authProxy)
+	mountReason, mountErr := co.syncAuthProxyCAMount(ctx, authProxy, cm, desiredDeployment, controllerContext.Recorder())
+	statusHandler.AddConditions(status.HandleProgressingOrDegraded("AuthProxyCAMountSync", mountReason, mountErr))
+	if mountErr != nil {
+		return statusHandler.FlushAndReturn(ctx, mountErr)
+	}
+
+	cm, cmErrReason, cmErr = co.SyncConfigMap(ctx, controllerContext.Recorder(), cm)
+	statusHandler.AddConditions(status.HandleProgressingOrDegraded("ConfigMapSync", cmErrReason, cmErr))
+	if cmErr != nil {
+		return statusHandler.FlushAndReturn(ctx, cmErr)
+	}
+
 	actualDeployment, depErrReason, depErr := co.SyncDeployment(
 		ctx,
 		set.Operator,
@@ -279,6 +290,10 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
 	statusHandler.AddConditions(status.HandleProgressingOrDegraded("DeploymentSync", depErrReason, depErr))
 	if depErr != nil {
 		return statusHandler.FlushAndReturn(ctx, depErr)
+	}
+
+	if err := co.cleanupAuthProxyStagingConfigMap(ctx, actualDeployment); err != nil {
+		return statusHandler.FlushAndReturn(ctx, err)
 	}
 
 	statusHandler.UpdateDeploymentGeneration(actualDeployment)
@@ -441,10 +456,8 @@ func (co *consoleOperator) evaluateDeploymentAvailability(deployment *appsv1.Dep
 	return prefix, "InsufficientReplicas", fmt.Errorf("%v replicas available for console deployment", deployment.Status.ReadyReplicas)
 }
 
-// apply configmap (needs route)
-// by the time we get to the configmap, we can assume the route exits & is configured properly
-// therefore no additional error handling is needed here.
-func (co *consoleOperator) SyncConfigMap(
+// BuildConfigMap renders desired configuration without publishing it.
+func (co *consoleOperator) BuildConfigMap(
 	ctx context.Context,
 	operatorConfig *operatorv1.Console,
 	consoleConfig *configv1.Console,
@@ -547,21 +560,26 @@ func (co *consoleOperator) SyncConfigMap(
 	if err != nil {
 		return nil, "FailedConsoleConfigBuilder", err
 	}
+	return defaultConfigmap, "ConsoleConfigBuilder", nil
+}
+
+// SyncConfigMap publishes configuration only after staging its file dependencies.
+func (co *consoleOperator) SyncConfigMap(ctx context.Context, recorder events.Recorder, required *corev1.ConfigMap) (*corev1.ConfigMap, string, error) {
 	var cm *corev1.ConfigMap
-	var cmChanged bool
-	cmErr := controllersutil.RetryOnTransientError(func() error {
-		var e error
-		cm, cmChanged, e = co.applyConsoleConfigMap(ctx, recorder, defaultConfigmap)
-		return e
+	var changed bool
+	err := controllersutil.RetryOnTransientError(func() error {
+		var err error
+		cm, changed, err = co.applyConsoleConfigMap(ctx, recorder, required)
+		return err
 	})
-	if cmErr != nil {
-		return nil, "FailedApply", cmErr
+	if err != nil {
+		return nil, "FailedApply", err
 	}
-	if cmChanged {
+	if changed {
 		klog.V(4).Infoln("new console config yaml:")
 		klog.V(4).Infof("%s", redactURLUserinfo(cm.Data))
 	}
-	return cm, "ConsoleConfigBuilder", cmErr
+	return cm, "ConsoleConfigBuilder", nil
 }
 
 // urlUserinfoPattern matches the userinfo component of a URL (e.g. "user:pass@" or "user@"),

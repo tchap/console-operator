@@ -250,12 +250,7 @@ func TestSyncStagesAuthProxyMountBeforePublishingConfig(t *testing.T) {
 				t.Fatal(err)
 			}
 			co.authProxyResolver = stubProxyResolver{config: &proxyconfig.Config{TrustedCAName: "user-ca-bundle", HTTPSProxy: "https://proxy.example:3128"}}
-			if missingSecret {
-				// This lister deliberately lacks the OAuth client secret.
-				indexer := newIndexer(cache.MetaNamespaceKeyFunc)
-				indexer.Add(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: api.TargetNamespace, Name: api.ConsoleServingCertName}})
-				co.secretsLister = corev1listers.NewSecretLister(indexer)
-			}
+
 			assertUnchanged := func() {
 				t.Helper()
 				actual, err := client.CoreV1().ConfigMaps(api.TargetNamespace).Get(t.Context(), api.OpenShiftConsoleConfigMapName, metav1.GetOptions{})
@@ -285,11 +280,10 @@ func TestSyncStagesAuthProxyMountBeforePublishingConfig(t *testing.T) {
 			}
 			assertUnchanged()
 			// The new template alone is insufficient: old replicas must be gone
-			// and all replacement replicas must be available.
+			// and the Deployment controller must have observed the new template.
 			for _, rollout := range []struct{ updated, total, available int32 }{
 				{1, 2, 2}, // Old Pods are still counted.
 				{2, 3, 2}, // A surge replica is still present.
-				{2, 2, 1}, // Replacement Pods are not all available.
 			} {
 				dep.Status.ObservedGeneration = dep.Generation
 				dep.Status.UpdatedReplicas = rollout.updated
@@ -310,6 +304,12 @@ func TestSyncStagesAuthProxyMountBeforePublishingConfig(t *testing.T) {
 			if _, err := client.AppsV1().Deployments(api.TargetNamespace).UpdateStatus(t.Context(), dep, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
+			if missingSecret {
+				// This lister deliberately lacks the OAuth client secret.
+				indexer := newIndexer(cache.MetaNamespaceKeyFunc)
+				indexer.Add(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: api.TargetNamespace, Name: api.ConsoleServingCertName}})
+				co.secretsLister = corev1listers.NewSecretLister(indexer)
+			}
 			err = sync()
 			if missingSecret && !apierrors.IsNotFound(err) {
 				t.Fatalf("expected missing Secret, got %v", err)
@@ -317,6 +317,11 @@ func TestSyncStagesAuthProxyMountBeforePublishingConfig(t *testing.T) {
 			if !missingSecret && err != nil {
 				t.Fatal(err)
 			}
+			if missingSecret {
+				assertUnchanged()
+				return
+			}
+
 			cm, err := client.CoreV1().ConfigMaps(api.TargetNamespace).Get(t.Context(), api.OpenShiftConsoleConfigMapName, metav1.GetOptions{})
 			if err != nil {
 				t.Fatal(err)
@@ -431,5 +436,168 @@ func TestSyncAllowsConfigRepairWithAuthProxyMount(t *testing.T) {
 	}
 	if !strings.Contains(cm.Data["console-config.yaml"], "repaired-proxy.example") {
 		t.Fatal("configuration repair was not published")
+	}
+}
+
+func TestSyncFirstAuthProxyCARepairsUnhealthyConsole(t *testing.T) {
+	co, client, configs := newAuthProxyReconcileFixture(t, copiedCAPresent)
+	co.authProxyResolver = stubProxyResolver{config: &proxyconfig.Config{HTTPSProxy: "http://unreachable-proxy.example:3128"}}
+	recorder := events.NewInMemoryRecorder("test", clocktesting.NewFakePassiveClock(time.Now()))
+	sync := func() error { return co.handleSync(t.Context(), factory.NewSyncContext("test", recorder), configs) }
+	if err := sync(); err != nil {
+		t.Fatal(err)
+	}
+	refreshAuthProxyConfigMapLister(t, co, client)
+	// The same repair introduces issuer trust. Staging must use the entire
+	// desired Deployment, not just add the proxy CA to the old template.
+	authn, err := co.authnConfigLister.Get(api.ConfigResourceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authn = authn.DeepCopy()
+	authn.Spec.OIDCProviders[0].Issuer.CertificateAuthority.Name = "new-issuer-ca"
+	authnIndexer := newIndexer(cache.MetaNamespaceKeyFunc)
+	if err := authnIndexer.Add(authn); err != nil {
+		t.Fatal(err)
+	}
+	co.authnConfigLister = configlistersv1.NewAuthenticationLister(authnIndexer)
+	maps, err := co.targetNSConfigMapLister.List(labels.Everything())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIndexer := newIndexer(cache.MetaNamespaceKeyFunc)
+	for _, cm := range maps {
+		if err := targetIndexer.Add(cm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := targetIndexer.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "new-issuer-ca", Namespace: api.TargetNamespace}, Data: map[string]string{"ca-bundle.crt": "issuer trust"}}); err != nil {
+		t.Fatal(err)
+	}
+	co.targetNSConfigMapLister = corev1listers.NewConfigMapLister(targetIndexer)
+	co.authProxyResolver = stubProxyResolver{config: &proxyconfig.Config{HTTPSProxy: "https://working-proxy.example:3128", TrustedCAName: "user-ca-bundle"}}
+	if err := sync(); !consoleerrors.IsSyncError(err) {
+		t.Fatalf("expected staged rollout, got %v", err)
+	}
+	assertConfig := func(name, proxy string, withCA bool) {
+		t.Helper()
+		cm, err := client.CoreV1().ConfigMaps(api.TargetNamespace).Get(t.Context(), name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := cm.Data["console-config.yaml"]
+		if !strings.Contains(data, proxy) {
+			t.Fatalf("%s does not contain desired proxy %s", name, proxy)
+		}
+		if strings.Contains(data, api.AuthProxyCAMountDir+"/"+api.AuthProxyCAFileName) != withCA {
+			t.Fatalf("unexpected CA reference in %s", name)
+		}
+	}
+	assertConfig(api.OpenShiftConsoleConfigMapName, "unreachable-proxy.example", false)
+	assertConfig(api.AuthProxyStagingConfigMapName, "working-proxy.example", true)
+	dep, err := client.AppsV1().Deployments(api.TargetNamespace).Get(t.Context(), api.OpenShiftConsoleDeploymentName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := func() string {
+		for _, volume := range dep.Spec.Template.Spec.Volumes {
+			if volume.Name == api.OpenShiftConsoleConfigMapName && volume.ConfigMap != nil {
+				return volume.ConfigMap.Name
+			}
+		}
+		return ""
+	}
+	initialHash := dep.Spec.Template.Annotations["console.openshift.io/auth-proxy-config-hash"]
+	if source() != api.AuthProxyStagingConfigMapName {
+		t.Fatal("replacement Pods do not use the corrected staged configuration")
+	}
+	mounted := false
+	for _, mount := range dep.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if mount.Name == api.AuthProxyCAConfigMapName {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Fatal("replacement Pods lack the CA mount")
+	}
+	issuerMounted := false
+	for _, volume := range dep.Spec.Template.Spec.Volumes {
+		if volume.ConfigMap != nil && volume.ConfigMap.Name == "new-issuer-ca" {
+			issuerMounted = true
+		}
+	}
+	if !issuerMounted {
+		t.Fatal("replacement Pods lack desired issuer CA trust")
+	}
+
+	// Accept further corrections while RollingUpdate still has old Pods and an
+	// unavailable surge Pod. Waiting for readiness here would freeze repairs.
+	dep.Generation = 2
+	dep.Status.ObservedGeneration = 2
+	dep.Status.UpdatedReplicas = 1
+	dep.Status.Replicas = 3
+	dep.Status.AvailableReplicas = 0
+	if _, err := client.AppsV1().Deployments(api.TargetNamespace).Update(t.Context(), dep, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	co.authProxyResolver = stubProxyResolver{config: &proxyconfig.Config{HTTPSProxy: "https://corrected-proxy.example:3128", TrustedCAName: "user-ca-bundle"}}
+	if err := sync(); !consoleerrors.IsSyncError(err) {
+		t.Fatalf("expected staged correction, got %v", err)
+	}
+	assertConfig(api.AuthProxyStagingConfigMapName, "corrected-proxy.example", true)
+	assertConfig(api.OpenShiftConsoleConfigMapName, "unreachable-proxy.example", false)
+	dep, err = client.AppsV1().Deployments(api.TargetNamespace).Get(t.Context(), api.OpenShiftConsoleDeploymentName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousHash := dep.Spec.Template.Annotations["console.openshift.io/auth-proxy-config-hash"]
+	if previousHash == "" || previousHash == initialHash {
+		t.Fatal("staged configuration does not trigger a template rollout")
+	}
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.UpdatedReplicas = *dep.Spec.Replicas
+	dep.Status.Replicas = *dep.Spec.Replicas
+	dep.Status.AvailableReplicas = 0
+	if _, err := client.AppsV1().Deployments(api.TargetNamespace).UpdateStatus(t.Context(), dep, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sync(); err != nil {
+		t.Fatalf("zero ready replicas blocked the repair: %v", err)
+	}
+	assertConfig(api.OpenShiftConsoleConfigMapName, "corrected-proxy.example", true)
+	_, operatorStatus, _, err := co.operatorClient.GetOperatorState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, condition := range operatorStatus.Conditions {
+		if strings.HasPrefix(condition.Type, "AuthProxyCAMountSync") && condition.Status == operatorv1.ConditionTrue {
+			t.Fatalf("stale mount-sync condition after repair: %+v", condition)
+		}
+	}
+
+	dep, err = client.AppsV1().Deployments(api.TargetNamespace).Get(t.Context(), api.OpenShiftConsoleDeploymentName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source() != api.OpenShiftConsoleConfigMapName {
+		t.Fatal("handoff did not restore shared configuration volume")
+	}
+	// The old staged Pods can still exist until the final template is observed.
+	dep.Generation++
+	if _, err := client.CoreV1().ConfigMaps(api.TargetNamespace).Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: api.AuthProxyStagingConfigMapName, Namespace: api.TargetNamespace}}, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatal(err)
+	}
+	if err := co.cleanupAuthProxyStagingConfigMap(t.Context(), dep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CoreV1().ConfigMaps(api.TargetNamespace).Get(t.Context(), api.AuthProxyStagingConfigMapName, metav1.GetOptions{}); err != nil {
+		t.Fatal("staging configuration removed before final rollout")
+	}
+	dep.Status.ObservedGeneration = dep.Generation
+	if err := co.cleanupAuthProxyStagingConfigMap(t.Context(), dep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CoreV1().ConfigMaps(api.TargetNamespace).Get(t.Context(), api.AuthProxyStagingConfigMapName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("staging configuration not cleaned up: %v", err)
 	}
 }

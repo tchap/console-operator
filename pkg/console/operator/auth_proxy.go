@@ -2,19 +2,24 @@ package operator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
-	"github.com/openshift/console-operator/pkg/console/subresource/consoleserver"
-	deploymentsub "github.com/openshift/console-operator/pkg/console/subresource/deployment"
+
 	"gopkg.in/yaml.v2"
+
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-
+	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
 
 	"github.com/openshift/console-operator/pkg/api"
 	"github.com/openshift/console-operator/pkg/console/errors"
+	"github.com/openshift/console-operator/pkg/console/subresource/consoleserver"
+	deploymentsub "github.com/openshift/console-operator/pkg/console/subresource/deployment"
 	"github.com/openshift/console-operator/pkg/proxyconfig"
 )
 
@@ -54,9 +59,10 @@ func (c *consoleOperator) SyncAuthProxyTrustedCAConfigMap(proxy *proxyconfig.Con
 	return "", nil
 }
 
-// syncAuthProxyCAMount stages only the CA mount, retaining the currently published
-// Console configuration until the Deployment has replaced its old Pods.
-func (c *consoleOperator) syncAuthProxyCAMount(ctx context.Context, proxy *proxyconfig.Config) (string, error) {
+// syncAuthProxyCAMount gives replacement Pods the desired configuration together
+// with its CA mount, while old Pods retain the shared configuration. Staging must
+// also accept later repairs before waiting for rollout progress.
+func (c *consoleOperator) syncAuthProxyCAMount(ctx context.Context, proxy *proxyconfig.Config, requiredConfig *corev1.ConfigMap, requiredDeployment *appsv1.Deployment, recorder events.Recorder) (string, error) {
 	if proxy == nil || proxy.TrustedCAName == "" {
 		return "", nil
 	}
@@ -67,68 +73,6 @@ func (c *consoleOperator) syncAuthProxyCAMount(ctx context.Context, proxy *proxy
 	if err != nil {
 		return "FailedGetDeployment", err
 	}
-	updated := deployment.DeepCopy()
-	spec := &updated.Spec.Template.Spec
-	hasVolume, hasMount := false, false
-	volume := corev1.Volume{Name: api.AuthProxyCAConfigMapName, VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: api.AuthProxyCAConfigMapName}, Items: []corev1.KeyToPath{{Key: api.AuthProxyCAFileName, Path: api.AuthProxyCAFileName}}}}}
-	volumeIndex := -1
-	for i, existing := range spec.Volumes {
-		if existing.Name == volume.Name {
-			volumeIndex = i
-			hasVolume = existing.ConfigMap != nil && existing.ConfigMap.Name == volume.Name
-			if hasVolume && len(existing.ConfigMap.Items) > 0 {
-				hasVolume = false
-				for _, item := range existing.ConfigMap.Items {
-					if item.Key == api.AuthProxyCAFileName && item.Path == api.AuthProxyCAFileName {
-						hasVolume = true
-					}
-				}
-			}
-			break
-		}
-	}
-	if !hasVolume {
-		if volumeIndex < 0 {
-			spec.Volumes = append(spec.Volumes, volume)
-		} else {
-			spec.Volumes[volumeIndex] = volume
-		}
-	}
-	containerIndex := -1
-	for i := range spec.Containers {
-		if spec.Containers[i].Name == "console" {
-			containerIndex = i
-			break
-		}
-	}
-	if containerIndex < 0 {
-		return "InvalidDeployment", fmt.Errorf("Console Deployment has no console container")
-	}
-	mounts := &spec.Containers[containerIndex].VolumeMounts
-	mountIndex := -1
-	mount := corev1.VolumeMount{Name: api.AuthProxyCAConfigMapName, MountPath: api.AuthProxyCAMountDir, ReadOnly: true}
-	for i, existing := range *mounts {
-		if existing.Name == mount.Name {
-			mountIndex = i
-			hasMount = existing.MountPath == mount.MountPath && existing.SubPath == "" && existing.SubPathExpr == ""
-			break
-		}
-	}
-	if !hasMount {
-		if mountIndex < 0 {
-			*mounts = append(*mounts, mount)
-		} else {
-			(*mounts)[mountIndex] = mount
-		}
-	}
-	if !hasVolume || !hasMount {
-		if _, err := c.deploymentClient.Deployments(api.TargetNamespace).Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
-			return "FailedStageMount", err
-		}
-		return "AwaitingMountRollout", errors.NewSyncError("waiting for Console authentication proxy CA mount rollout")
-	}
-	// Once the CA path has been published, readiness must not prevent fixing
-	// unrelated configuration that could itself be keeping Console unhealthy.
 	current, err := c.configMapClient.ConfigMaps(api.TargetNamespace).Get(ctx, api.OpenShiftConsoleConfigMapName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return "", nil
@@ -137,15 +81,85 @@ func (c *consoleOperator) syncAuthProxyCAMount(ctx context.Context, proxy *proxy
 		return "FailedGetConsoleConfigMap", err
 	}
 	var config consoleserver.Config
-	if err := yaml.Unmarshal([]byte(current.Data["console-config.yaml"]), &config); err == nil && config.Auth.Proxy != nil && config.Auth.Proxy.TrustedCAFilePath == api.AuthProxyCAMountDir+"/"+api.AuthProxyCAFileName {
+	publishedCA := yaml.Unmarshal([]byte(current.Data["console-config.yaml"]), &config) == nil && config.Auth.Proxy != nil && config.Auth.Proxy.TrustedCAFilePath == api.AuthProxyCAMountDir+"/"+api.AuthProxyCAFileName
+	if publishedCA {
 		return "", nil
 	}
+	updated := deployment.DeepCopy()
+	updated.Spec = *requiredDeployment.Spec.DeepCopy()
+	spec := &updated.Spec.Template.Spec
+	// Only new Pods consume this ConfigMap. Publishing a repair here cannot
+	// expose the CA path to old Pods that do not have the CA volume.
+	stagingConfig := requiredConfig.DeepCopy()
+	stagingConfig.Name = api.AuthProxyStagingConfigMapName
+	if _, _, err := c.applyConsoleConfigMap(ctx, recorder, stagingConfig); err != nil {
+		return "FailedStageConfig", err
+	}
+	configVolume := -1
+	for i := range spec.Volumes {
+		if spec.Volumes[i].Name == api.OpenShiftConsoleConfigMapName && spec.Volumes[i].ConfigMap != nil {
+			configVolume = i
+			break
+		}
+	}
+	if configVolume < 0 {
+		return "InvalidDeployment", fmt.Errorf("Console Deployment has no configuration volume")
+	}
+	staged := false
+	for _, volume := range deployment.Spec.Template.Spec.Volumes {
+		if volume.Name == api.OpenShiftConsoleConfigMapName && volume.ConfigMap != nil && volume.ConfigMap.Name == api.AuthProxyStagingConfigMapName {
+			staged = true
+		}
+	}
+	spec.Volumes[configVolume].ConfigMap.Name = api.AuthProxyStagingConfigMapName
+	const configHashAnnotation = "console.openshift.io/auth-proxy-config-hash"
+	stagingData, err := json.Marshal(struct {
+		Config map[string]string
+		Spec   appsv1.DeploymentSpec
+	}{stagingConfig.Data, updated.Spec})
+	if err != nil {
+		return "FailedStageConfig", err
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(stagingData))
+	previousHash := deployment.Spec.Template.Annotations[configHashAnnotation]
+	if updated.Spec.Template.Annotations == nil {
+		updated.Spec.Template.Annotations = map[string]string{}
+	}
+	updated.Spec.Template.Annotations[configHashAnnotation] = hash
+	if !staged || previousHash != hash {
+		if _, err := c.deploymentClient.Deployments(api.TargetNamespace).Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+			return "FailedStageMount", err
+		}
+		return "AwaitingMountRollout", errors.NewSyncError("waiting for Console authentication proxy CA mount rollout")
+	}
+	if !authProxyMountRolloutComplete(deployment) {
+		return "AwaitingMountRollout", errors.NewSyncError("waiting for Console authentication proxy CA mount rollout")
+	}
+	return "", nil
+}
+
+// Mount safety depends on replacing old Pod templates, not on OIDC readiness.
+func authProxyMountRolloutComplete(deployment *appsv1.Deployment) bool {
 	replicas := int32(deploymentsub.DefaultConsoleReplicas)
 	if deployment.Spec.Replicas != nil {
 		replicas = *deployment.Spec.Replicas
 	}
-	if deployment.Status.ObservedGeneration < deployment.Generation || deployment.Status.UpdatedReplicas != replicas || deployment.Status.Replicas != replicas || deployment.Status.AvailableReplicas < replicas {
-		return "AwaitingMountRollout", errors.NewSyncError("waiting for Console authentication proxy CA mount rollout")
+	return deployment.Status.ObservedGeneration >= deployment.Generation && deployment.Status.UpdatedReplicas == replicas && deployment.Status.Replicas == replicas
+}
+
+// Keep staging configuration until no remaining Pod uses that volume source.
+func (c *consoleOperator) cleanupAuthProxyStagingConfigMap(ctx context.Context, deployment *appsv1.Deployment) error {
+	for _, volume := range deployment.Spec.Template.Spec.Volumes {
+		if volume.ConfigMap != nil && volume.ConfigMap.Name == api.AuthProxyStagingConfigMapName {
+			return nil
+		}
 	}
-	return "", nil
+	if !authProxyMountRolloutComplete(deployment) {
+		return nil
+	}
+	err := c.configMapClient.ConfigMaps(api.TargetNamespace).Delete(ctx, api.AuthProxyStagingConfigMapName, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
