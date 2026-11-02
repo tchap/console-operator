@@ -186,14 +186,18 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
 		return statusHandler.FlushAndReturn(ctx, olmLifecycleMetadataErr)
 	}
 
-	// Must run before SyncConfigMap: it confirms the auth proxy CA copy exists (if
-	// configured) so we never publish a console-config.yaml referencing a CA file
-	// that no Pod's volume mounts, which would otherwise persist indefinitely while
-	// the copy is pending.
+	// Confirm the CA copy exists before staging its mount or publishing a
+	// Console configuration that references it.
 	authProxyTrustedCAErrReason, authProxyTrustedCAErr := co.SyncAuthProxyTrustedCAConfigMap(authProxy)
 	statusHandler.AddConditions(status.HandleProgressingOrDegraded("AuthProxyTrustedCASync", authProxyTrustedCAErrReason, authProxyTrustedCAErr))
 	if authProxyTrustedCAErr != nil {
 		return statusHandler.FlushAndReturn(ctx, authProxyTrustedCAErr)
+	}
+
+	authProxyMountReason, authProxyMountErr := co.syncAuthProxyCAMount(ctx, authProxy)
+	statusHandler.AddConditions(status.HandleProgressingOrDegraded("AuthProxyCAMountSync", authProxyMountReason, authProxyMountErr))
+	if authProxyMountErr != nil {
+		return statusHandler.FlushAndReturn(ctx, authProxyMountErr)
 	}
 
 	additionalHosts := routesub.GetAdditionalRouteHostnames(set.Ingress)
@@ -547,7 +551,7 @@ func (co *consoleOperator) SyncConfigMap(
 	var cmChanged bool
 	cmErr := controllersutil.RetryOnTransientError(func() error {
 		var e error
-		cm, cmChanged, e = resourceapply.ApplyConfigMap(ctx, co.configMapClient, recorder, defaultConfigmap)
+		cm, cmChanged, e = co.applyConsoleConfigMap(ctx, recorder, defaultConfigmap)
 		return e
 	})
 	if cmErr != nil {
@@ -562,7 +566,7 @@ func (co *consoleOperator) SyncConfigMap(
 
 // urlUserinfoPattern matches the userinfo component of a URL (e.g. "user:pass@" or "user@"),
 // which the auth proxy URLs configured on AuthProxy.HTTPProxy/HTTPSProxy may embed.
-var urlUserinfoPattern = regexp.MustCompile(`://[^/\s@]+@`)
+var urlUserinfoPattern = regexp.MustCompile(`://[^/\s]+@`)
 
 // redactURLUserinfo returns a copy of data with any URL userinfo (credentials) redacted,
 // so console-config.yaml contents can be logged without leaking auth proxy credentials.

@@ -1047,6 +1047,11 @@ func TestRedactURLUserinfo(t *testing.T) {
 			want: map[string]string{"console-config.yaml": "httpProxy: http://redacted@proxy.example.com:3128"},
 		},
 		{
+			name: "redacts password containing an at sign",
+			in:   map[string]string{"console-config.yaml": "httpsProxy: https://user:pa@ss@proxy.example.com:3128"},
+			want: map[string]string{"console-config.yaml": "httpsProxy: https://redacted@proxy.example.com:3128"},
+		},
+		{
 			name: "redacts user only",
 			in:   map[string]string{"console-config.yaml": "httpsProxy: https://user@proxy.example.com:3128"},
 			want: map[string]string{"console-config.yaml": "httpsProxy: https://redacted@proxy.example.com:3128"},
